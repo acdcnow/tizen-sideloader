@@ -47,9 +47,9 @@ no `glfw3.dll`, `libstdc++-6.dll`, `libgcc_s_*.dll` or `libwinpthread-1.dll`.
 The binary starts and keeps its render loop alive (process stays responsive); the
 GUI was not inspected interactively.
 
-The executable is built as a **console** application on purpose: `sdb` and `tizen` write
-their progress to stdout, and the app tells the user to "check the console for more
-info". Running it therefore opens a console window next to the ImGui window.
+The executable is built as a **console** application on purpose: it keeps stray `printf`
+output visible, but all `sdb`/`tizen` output is captured by the app itself and shown in the
+**Log** window (`Show log`) and in the error dialogs.
 
 `imgui.ini` is written next to the executable (Dear ImGui default), which is why
 `dist/` is git-ignored.
@@ -92,6 +92,8 @@ unchanged, so the Linux/macOS build behaves exactly as before):
 |---|---|
 | `g++ not found` | toolchain not installed — run the `winget` line above, then open a new shell |
 | GLFW download fails | offline/proxy; download `glfw-*.bin.WIN64.zip` manually and extract it so that `libs\glfw\include\GLFW\glfw3.h` exists |
-| Window opens, but "An error occured :(" when connecting | read the console: wrong IP/port, TV not in developer mode, or Tizen Studio path not set |
-| `sdb` is not recognized | the path field points at `tizen-studio\tools` instead of `tizen-studio` |
+| `dist\tizen-sideloader.exe is running (pid …)` | close the app before building — Windows locks a running executable |
+| Dialog "Tizen Studio CLI not found" | the configured folder has no `tools\sdb.exe` / `tools\ide\bin\tizen.bat`; install the CLI-only Tizen Studio and point "Configure tizen-studio" at that folder |
+| Dialog "Command failed" when connecting | read the dialog: it shows the exact command, the full output and the exit code. Typical: TV not in developer mode, PC IP not registered, wrong IP, TV offline |
+| `sdb` says the device is `offline` / `unauthorized` | developer mode not active on the TV, or the host IP was changed and the TV was not rebooted |
 | Blank/black ImGui window | GPU driver without OpenGL 3.0 — update the driver |

@@ -17,6 +17,10 @@ there is nothing to install beside it.
 > It runs as a **console** application on purpose: `sdb` and `tizen` write their progress
 to the console, and the dialogs tell you to check it when a step fails.
 
+> Commands run in the background and everything they print is captured in the in-app
+> **Log** window (`Show log`). Errors open a dialog with the exact command line, the
+> full output and the exit code - no separate console window to hunt for.
+
 ## Usage
 
 1. Install the **Tizen Studio CLI** (the "CLI" installer - no IDE needed) and note the
@@ -26,9 +30,10 @@ to the console, and the dialogs tell you to check it when a step fails.
    *Settings \u25b8 General \u25b8 External Device Manager \u25b8 Device Manager*.
 3. Start `tizen-sideloader.exe`, press **Configure tizen-studio** and enter that folder
    (without a trailing backslash).
-4. Enter the TV's **IP** and **port** (default `26101`) and press **Connect!**.
-5. **Choose WGT** \u2192 pick your `.wgt` \u2192 **Sideload!**. Progress and errors appear in the
-   console; the result is also shown in a dialog.
+4. Enter the TV's **IP address** and press **Connect!** - port **26101** is used
+   automatically (`IP:port` is only needed if you changed it).
+5. **Choose WGT** \u2192 pick your `.wgt` \u2192 **Sideload!**. The result appears in a dialog,
+   the full transcript in the log window.
 
 # How to Build
 Tested on Linux and Windows. Other Unixes are untested (the Makefile has a MinGW branch,

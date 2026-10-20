@@ -26,6 +26,14 @@
 #include <stdlib.h>
 #include <chrono>
 #include <thread>
+#include <mutex>
+#include <memory>
+#include <vector>
+#include <cctype>
+#include <cstdio>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 void setImGuiWindowSizeToOSWindow(GLFWwindow* window);
 
@@ -47,27 +55,242 @@ static void glfw_error_callback(int error, const char* description)
 }
 
 // ---------------------------------------------------------------------------
-// Tizen CLI invocation.
-// On Windows the tools are sdb.exe and tizen.bat and tizen-studio is commonly
-// installed under "C:\Program Files\...", so the tool path has to be quoted;
-// on Unix the original unquoted form is kept.
+// Tizen CLI invocation and logging.
+//
+// On Windows the tools are sdb.exe / tizen.bat and tizen-studio is commonly
+// installed under "C:\Program Files\...", so the tool path is quoted; on Unix
+// the original unquoted form is used.
+//
+// Every command runs on a worker thread so the window keeps rendering, and its
+// stdout+stderr is captured into an in-app log window. That log is what the
+// dialogs point at now - a GUI user never sees the console.
 // ---------------------------------------------------------------------------
-static std::string tizen_sdb_command(const char* tizenloc, const std::string& target)
-{
 #ifdef _WIN32
-    return std::string("\"") + tizenloc + "\\tools\\sdb.exe\" connect " + target;
+#define TIZEN_POPEN  _popen
+#define TIZEN_PCLOSE _pclose
 #else
-    return std::string(tizenloc) + "/tools/sdb connect " + target;
+#define TIZEN_POPEN  popen
+#define TIZEN_PCLOSE pclose
+#endif
+
+static const char* kDefaultSdbPort = "26101";
+
+// Shared between the UI thread and the command workers.
+struct LogState
+{
+    std::mutex mutex;
+    std::string text;
+    bool busy = false;
+    bool has_unseen_failure = false;
+    bool has_unseen_success = false;
+    std::string title;
+    std::string transcript;
+};
+
+static std::shared_ptr<LogState> g_log = std::make_shared<LogState>();
+static bool g_show_log = false;
+
+static std::string trim_path(std::string path)
+{
+    while (!path.empty() && (path.back() == '\\' || path.back() == '/'))
+        path.pop_back();
+    return path;
+}
+
+static std::string tizen_tool_path(const std::string& tizenloc,
+                                   const char* relative_windows,
+                                   const char* relative_unix)
+{
+    const std::string base = trim_path(tizenloc);
+#ifdef _WIN32
+    return std::string("\"") + base + "\\" + relative_windows + "\"";
+#else
+    (void)relative_windows;
+    return base + "/" + relative_unix;
 #endif
 }
 
-static std::string tizen_install_command(const char* tizenloc, const std::string& wgt)
+static std::string sdb_path(const std::string& tizenloc)
+{
+    return tizen_tool_path(tizenloc, "tools\\sdb.exe", "tools/sdb");
+}
+
+static std::string tizen_cli_path(const std::string& tizenloc)
+{
+    return tizen_tool_path(tizenloc, "tools\\ide\\bin\\tizen.bat", "tools/ide/bin/tizen");
+}
+
+// Bare paths (no quoting) used for the existence check and the error dialog.
+static std::string sdb_executable(const std::string& tizenloc)
 {
 #ifdef _WIN32
-    return std::string("\"") + tizenloc + "\\tools\\ide\\bin\\tizen.bat\" install -n \"" + wgt + "\"";
+    return trim_path(tizenloc) + "\\tools\\sdb.exe";
 #else
-    return std::string(tizenloc) + "/tools/ide/bin/tizen install -n \"" + wgt + "\"";
+    return trim_path(tizenloc) + "/tools/sdb";
 #endif
+}
+
+static std::string tizen_executable(const std::string& tizenloc)
+{
+#ifdef _WIN32
+    return trim_path(tizenloc) + "\\tools\\ide\\bin\\tizen.bat";
+#else
+    return trim_path(tizenloc) + "/tools/ide/bin/tizen";
+#endif
+}
+
+static bool file_exists(const std::string& path)
+{
+    std::FILE* handle = std::fopen(path.c_str(), "rb");
+    if (handle == nullptr)
+        return false;
+    std::fclose(handle);
+    return true;
+}
+
+static bool sdb_available(const std::string& tizenloc)
+{
+    return file_exists(sdb_executable(tizenloc));
+}
+
+// "192.168.1.50" -> "192.168.1.50:26101". A value that already carries a port
+// is passed through unchanged, so an unusual setup still works.
+static std::string with_default_port(const std::string& ip)
+{
+    std::string target = ip;
+    while (!target.empty() && std::isspace(static_cast<unsigned char>(target.front())))
+        target.erase(target.begin());
+    while (!target.empty() && std::isspace(static_cast<unsigned char>(target.back())))
+        target.pop_back();
+    if (target.empty())
+        return target;
+    if (target.find(':') == std::string::npos)
+        target += std::string(":") + kDefaultSdbPort;
+    return target;
+}
+
+static std::string sdb_connect_command(const std::string& tizenloc, const std::string& target)
+{
+    return sdb_path(tizenloc) + " connect " + target;
+}
+
+static std::string sdb_devices_command(const std::string& tizenloc)
+{
+    return sdb_path(tizenloc) + " devices";
+}
+
+static std::string tizen_install_command(const std::string& tizenloc, const std::string& wgt)
+{
+    return tizen_cli_path(tizenloc) + " install -n \"" + wgt + "\"";
+}
+
+struct CommandResult
+{
+    std::string output;
+    int exit_code = -1;
+    double seconds = 0.0;
+};
+
+// Runs one command through the shell with stderr folded into stdout.
+static CommandResult run_command(const std::string& command)
+{
+    CommandResult result;
+    const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    const std::string shell_command = command + " 2>&1";
+
+    FILE* pipe = TIZEN_POPEN(shell_command.c_str(), "r");
+    if (pipe == nullptr)
+    {
+        result.output = "could not start a shell for: " + command + "\n";
+        return result;
+    }
+
+    char buffer[4096];
+    while (std::fgets(buffer, sizeof(buffer), pipe) != nullptr)
+        result.output += buffer;
+
+    const int status = TIZEN_PCLOSE(pipe);
+#ifdef _WIN32
+    result.exit_code = status;
+#else
+    result.exit_code = (status == -1) ? -1 : WEXITSTATUS(status);
+#endif
+    result.seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    return result;
+}
+
+static void append_log_locked(LogState& state, const std::string& text)
+{
+    state.text += text;
+    const std::size_t limit = 200000;
+    if (state.text.size() > limit)
+    {
+        state.text.erase(0, state.text.size() - (limit * 3 / 4));
+        state.text.insert(0, "[... earlier output trimmed ...]\n");
+    }
+}
+
+static std::string log_snapshot()
+{
+    std::lock_guard<std::mutex> lock(g_log->mutex);
+    return g_log->text;
+}
+
+static std::string tail_of(const std::string& text, std::size_t max_chars = 2400)
+{
+    if (text.size() <= max_chars)
+        return text;
+    return "[...]\n" + text.substr(text.size() - max_chars);
+}
+
+// Starts `command` on a worker thread. When it fails, `diagnostic_command` is
+// run as well (e.g. `sdb devices`) so the log explains the failure.
+static void start_command(const std::string& title, const std::string& command,
+                          const std::string& diagnostic_command)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_log->mutex);
+        if (g_log->busy)
+            return;
+        g_log->busy = true;
+    }
+
+    // Keeps the shared state alive even if the app is closing while we run.
+    const std::shared_ptr<LogState> state = g_log;
+    std::thread([state, title, command, diagnostic_command]()
+    {
+        std::string transcript = "\n=== " + title + " ===\n$ " + command + "\n";
+
+        CommandResult result = run_command(command);
+        transcript += result.output;
+        if (!result.output.empty() && result.output.back() != '\n')
+            transcript += "\n";
+
+        const bool ok = (result.exit_code == 0);
+        if (!ok && !diagnostic_command.empty())
+        {
+            CommandResult diagnostic = run_command(diagnostic_command);
+            transcript += "\n$ " + diagnostic_command + "\n" + diagnostic.output;
+            if (!diagnostic.output.empty() && diagnostic.output.back() != '\n')
+                transcript += "\n";
+        }
+
+        char summary[160];
+        std::snprintf(summary, sizeof(summary), "[%s, exit code %d, %.1f s]\n",
+                      ok ? "OK" : "FAILED", result.exit_code, result.seconds);
+        transcript += summary;
+
+        std::lock_guard<std::mutex> lock(state->mutex);
+        append_log_locked(*state, transcript);
+        state->busy = false;
+        state->title = title;
+        state->transcript = transcript;
+        if (ok)
+            state->has_unseen_success = true;
+        else
+            state->has_unseen_failure = true;
+    }).detach();
 }
 
 // Main code
@@ -171,65 +394,120 @@ int main(int, char**)
 
         // 2. Show a simple window that we create ourselves. We use a Begin/End pair to create a named window.
         {
-            std::string s;
-            std::string command;
-            static char str0[15] = "";
-            static char str1[7] = "";
-            static int clicked = 0;
+            static char str0[64] = "";
             static std::string filePath;
-            static int sideload;
             static std::string filePathName;
             static int tizendialog = 0;
-            static char tizenloc[155];
-            static int demowindow;
+            static char tizenloc[155] = "";
+            static int demowindow = 0;
+
 
             ImGui::Begin("Tizen Sideloader");                         
-            ImGui::Text("Enter device IP and Port:");
-            ImGui::PushItemWidth(110);               
-            ImGui::InputTextWithHint("##IP", "IP", str0, IM_ARRAYSIZE(str0));
-            ImGui::SameLine();
-            ImGui::Text(":");
-            ImGui::SameLine();
-            ImGui::PushItemWidth(50);
-            ImGui::InputTextWithHint("##Port", "Port", str1, IM_ARRAYSIZE(str1));
-            ImGui::PopItemWidth();
-            std::ostringstream str2;
-            str2 << str0 << ":" << str1;
-            //std::cout << str2.str();           
-            //std::cout << str0;
-            ImGui::SameLine();
-            if (ImGui::Button("Connect!"))
-                clicked++;
-
-            if (clicked & 1) {
-                 std::cout << str0;
-                 std::string command = tizen_sdb_command(tizenloc, str2.str());
-                 int code = system(command.c_str());
-                 clicked = 0;
-
-                 if (code == 0) {
-                     clicked = 0;
-                     ImGui::SameLine();
-                     ImGui::Text("Device connected! :)");
-                 } else {
-                     ImGui::SameLine();
-                     ImGui::Text("An error occured :(");
-                     ImGui::OpenPopup("An error occured :(");
-             }
-
+            bool busy = false;
+            bool failure_pending = false;
+            bool success_pending = false;
+            bool last_was_sideload = false;
+            std::string result_text;
+            std::string last_title;
+            {
+                std::lock_guard<std::mutex> lock(g_log->mutex);
+                busy = g_log->busy;
+                failure_pending = g_log->has_unseen_failure;
+                success_pending = g_log->has_unseen_success;
+                result_text = g_log->transcript;
+                last_title = g_log->title;
+                last_was_sideload = (g_log->title.rfind("tizen install", 0) == 0);
+                g_log->has_unseen_failure = false;
+                g_log->has_unseen_success = false;
             }
+            if (failure_pending)
+                ImGui::OpenPopup("Command failed");
+            if (success_pending)
+                ImGui::OpenPopup("Command finished");
+
+            ImGui::Text("TV IP address (port %s is added automatically):", kDefaultSdbPort);
+            ImGui::PushItemWidth(200);
+            ImGui::InputTextWithHint("##IP", "192.168.1.50", str0, IM_ARRAYSIZE(str0));
+            ImGui::PopItemWidth();
+            ImGui::SameLine();
+            ImGui::TextDisabled("or IP:port to override");
+
+            const std::string target = with_default_port(str0);
+            if (target.empty())
+                ImGui::TextDisabled("target: <IP>:%s", kDefaultSdbPort);
+            else
+                ImGui::TextDisabled("target: %s", target.c_str());
+
+            if (!std::string(tizenloc).empty() && !sdb_available(tizenloc))
+                ImGui::TextColored(ImVec4(1.00f, 0.45f, 0.45f, 1.00f),
+                                   "sdb.exe not found - check the tizen-studio folder");
+
+            ImGui::BeginDisabled(busy);
+            if (ImGui::Button("Connect!"))
+            {
+                if (std::string(tizenloc).empty())
+                {
+                    tizendialog++;
+                }
+                else if (!sdb_available(tizenloc))
+                {
+                    ImGui::OpenPopup("Tizen Studio CLI not found");
+                }
+                else if (target.empty())
+                {
+                    ImGui::OpenPopup("No IP address");
+                }
+                else
+                {
+                    start_command("sdb connect " + target,
+                                  sdb_connect_command(tizenloc, target),
+                                  sdb_devices_command(tizenloc));
+                }
+            }
+            ImGui::SameLine();
+            if (busy)
+                ImGui::TextColored(ImVec4(1.00f, 0.75f, 0.20f, 1.00f), "running ...");
+            else if (!last_title.empty())
+                ImGui::TextDisabled("last command: %s", last_title.c_str());
+            ImGui::EndDisabled();
 
             if (ImGui::Button("Choose WGT", ImVec2(250,100))) {
                 IGFD::FileDialogConfig config;
                 config.path = ".";
                 ImGuiFileDialog::Instance()->OpenDialog("ChooseFileDlgKey", "Choose File", ".wgt", config);
             }
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", filePathName.empty() ? "no .wgt selected yet" : filePathName.c_str());
 
+            ImGui::BeginDisabled(busy);
             if (ImGui::Button("Sideload!", ImVec2(250,150)))
-                sideload++;
+            {
+                if (filePathName.empty())
+                {
+                    ImGui::OpenPopup("No WGT selected");
+                }
+                else if (std::string(tizenloc).empty())
+                {
+                    tizendialog++;
+                }
+                else if (!file_exists(tizen_executable(tizenloc)))
+                {
+                    ImGui::OpenPopup("Tizen Studio CLI not found");
+                }
+                else
+                {
+                    start_command("tizen install " + filePathName,
+                                  tizen_install_command(tizenloc, filePathName),
+                                  sdb_devices_command(tizenloc));
+                }
+            }
+            ImGui::EndDisabled();
 
             if (ImGui::Button("Configure tizen-studio", ImVec2(250,50)))
                 tizendialog++;
+            ImGui::SameLine();
+            if (ImGui::Button(g_show_log ? "Hide log" : "Show log", ImVec2(120, 50)))
+                g_show_log = !g_show_log;
 
             if (ImGuiFileDialog::Instance()->Display("ChooseFileDlgKey")) {
                 if (ImGuiFileDialog::Instance()->IsOk()) { // action if OK
@@ -248,17 +526,6 @@ int main(int, char**)
                 demowindow++;
   
 
-           if (sideload & 1) {
-               std::string sideloadcommand = tizen_install_command(tizenloc, filePathName);
-               int sideloadcode = system(sideloadcommand.c_str());
-               sideload = 0;
-
-               if (sideloadcode == 0) {
-                   ImGui::OpenPopup("Sideloading Successful :)");
-               } else {
-                   ImGui::OpenPopup("An error occured sideloading :(");
-               }
-           }
 
            if (tizendialog & 1) {
                ImGui::OpenPopup("Configure tizen-studio");
@@ -268,18 +535,68 @@ int main(int, char**)
                ImGui::ShowDemoWindow();
            }
              
-           if (ImGui::BeginPopupModal("An error occured :(", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
-        
-                ImGui::Text("An error has occured while connecting to your TV.");
-                ImGui::Text("Please ensure you have entered the correct IP and port and your TV is in developer mode.");
-                ImGui::Text("Please also ensure that you have set the location of tizen-studio.");
-                ImGui::Text("Check the console for more info.");
+           if (ImGui::BeginPopupModal("Tizen Studio CLI not found", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::TextUnformatted("The Tizen Studio CLI was not found at:");
+                ImGui::TextDisabled("%s", tizenloc);
+                ImGui::TextUnformatted("Expected these files:");
+                ImGui::TextDisabled("  %s", sdb_executable(tizenloc).c_str());
+                ImGui::TextDisabled("  %s", tizen_executable(tizenloc).c_str());
                 ImGui::Separator();
-
+                ImGui::TextUnformatted("Install \"Tizen Studio with CLI\" (the IDE is not needed), then");
+                ImGui::TextUnformatted("press \"Configure tizen-studio\" and point it at that folder.");
+                ImGui::TextLinkOpenURL("Download Tizen Studio", "https://developer.tizen.org/development/tizen-studio/download");
+                ImGui::Separator();
                 if (ImGui::Button("OK", ImVec2(120, 0))) { ImGui::CloseCurrentPopup(); }
-                    ImGui::SetItemDefaultFocus();
-                    ImGui::SameLine();
-                    ImGui::EndPopup();
+                ImGui::EndPopup();
+        }
+
+           if (ImGui::BeginPopupModal("No IP address", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::TextUnformatted("Enter the IP address of the TV, e.g. 192.168.1.50.");
+                ImGui::TextUnformatted("Port 26101 is used automatically; append :port to override it.");
+                ImGui::Separator();
+                if (ImGui::Button("OK", ImVec2(120, 0))) { ImGui::CloseCurrentPopup(); }
+                ImGui::EndPopup();
+        }
+
+           if (ImGui::BeginPopupModal("No WGT selected", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::TextUnformatted("Choose a .wgt file first (button \"Choose WGT\").");
+                ImGui::Separator();
+                if (ImGui::Button("OK", ImVec2(120, 0))) { ImGui::CloseCurrentPopup(); }
+                ImGui::EndPopup();
+        }
+
+           if (ImGui::BeginPopupModal("Command failed", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::TextUnformatted("The Tizen CLI reported an error. Full output:");
+                ImGui::Separator();
+                ImGui::BeginChild("failure_log", ImVec2(760, 260), ImGuiChildFlags_Border, ImGuiWindowFlags_HorizontalScrollbar);
+                ImGui::TextUnformatted(tail_of(result_text).c_str());
+                ImGui::SetScrollHereY(1.0f);
+                ImGui::EndChild();
+                ImGui::TextUnformatted("Hints: TV in developer mode with this PC's IP registered, same network,");
+                ImGui::TextUnformatted("tizen-studio CLI path set, TV reachable on port 26101.");
+                ImGui::Separator();
+                if (ImGui::Button("Copy to clipboard", ImVec2(160, 0))) { ImGui::SetClipboardText(result_text.c_str()); }
+                ImGui::SameLine();
+                if (ImGui::Button(g_show_log ? "Hide log" : "Show log", ImVec2(120, 0))) { g_show_log = !g_show_log; }
+                ImGui::SameLine();
+                if (ImGui::Button("Close", ImVec2(120, 0))) { ImGui::CloseCurrentPopup(); }
+                ImGui::EndPopup();
+        }
+
+           if (ImGui::BeginPopupModal("Command finished", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::TextColored(ImVec4(0.40f, 0.90f, 0.40f, 1.00f),
+                                   last_was_sideload ? "Sideload completed." : "Command completed.");
+                ImGui::TextUnformatted(last_was_sideload
+                                       ? "The app should now show up on your TV."
+                                       : "See the log for the full output.");
+                ImGui::Separator();
+                ImGui::BeginChild("success_log", ImVec2(700, 160), ImGuiChildFlags_Border, ImGuiWindowFlags_HorizontalScrollbar);
+                ImGui::TextUnformatted(tail_of(result_text, 1200).c_str());
+                ImGui::SetScrollHereY(1.0f);
+                ImGui::EndChild();
+                ImGui::Separator();
+                if (ImGui::Button("OK", ImVec2(120, 0))) { ImGui::CloseCurrentPopup(); }
+                ImGui::EndPopup();
         }
 
            if (ImGui::BeginPopupModal("Configure tizen-studio", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -301,37 +618,48 @@ int main(int, char**)
             
 
 
-           if (ImGui::BeginPopupModal("An error occured sideloading :(", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
-                ImGui::Text("An error has occured while sideloading.");
-                ImGui::Text("Please ensure the WGT file is compatible with your TV and your TV is connected to your device.");
-                ImGui::Text("Please also ensure that you have set the location of tizen-studio.");
-                ImGui::Text("Check the console for more info.");
-                ImGui::Separator();
 
-                if (ImGui::Button("OK", ImVec2(120, 0))) { ImGui::CloseCurrentPopup(); }
-                    ImGui::SetItemDefaultFocus();
-                    ImGui::SameLine();
-                    ImGui::EndPopup();
-        }
 
-           if (ImGui::BeginPopupModal("Sideloading Successful :)", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
-        
-                ImGui::Text("Sideloading Successful!");
-                ImGui::Text("You should now see the app on your TV.");
-                ImGui::Text("If you found this tool useful please consider leaving a ☆ on Github :3");
-                ImGui::Separator();
 
-                if (ImGui::Button("OK", ImVec2(120, 0))) { ImGui::CloseCurrentPopup(); }
-                    ImGui::SetItemDefaultFocus();
-                    ImGui::SameLine();
-                    ImGui::EndPopup();
-        }
 
 
 }
 
 ImGui::End();
         
+
+        if (g_show_log)
+        {
+            ImGui::SetNextWindowSize(ImVec2(900, 420), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Log", &g_show_log))
+            {
+                const std::string log_text = log_snapshot();
+                static std::size_t last_size = 0;
+
+                if (ImGui::Button("Copy"))
+                    ImGui::SetClipboardText(log_text.c_str());
+                ImGui::SameLine();
+                if (ImGui::Button("Clear"))
+                {
+                    std::lock_guard<std::mutex> lock(g_log->mutex);
+                    g_log->text.clear();
+                    last_size = 0;
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("%d characters - every command is captured here", static_cast<int>(log_text.size()));
+                ImGui::Separator();
+
+                ImGui::BeginChild("log_view", ImVec2(0, 0), ImGuiChildFlags_Border, ImGuiWindowFlags_HorizontalScrollbar);
+                ImGui::TextUnformatted(log_text.c_str(), log_text.c_str() + log_text.size());
+                if (log_text.size() != last_size)
+                {
+                    last_size = log_text.size();
+                    ImGui::SetScrollHereY(1.0f);
+                }
+                ImGui::EndChild();
+            }
+            ImGui::End();
+        }
 
         // Rendering
         ImGui::Render();

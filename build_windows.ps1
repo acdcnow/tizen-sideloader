@@ -83,7 +83,18 @@ try {
     $root = (Get-Location).Path
     New-Item -ItemType Directory -Force -Path 'dist', 'build' | Out-Null
     $exe = 'dist\tizen-sideloader.exe'
-    if (Test-Path $exe) { Remove-Item $exe -Force }
+    if (Test-Path $exe) {
+        try {
+            Remove-Item $exe -Force -ErrorAction Stop
+        }
+        catch {
+            $running = Get-Process -Name 'tizen-sideloader' -ErrorAction SilentlyContinue
+            if ($running) {
+                throw "dist\tizen-sideloader.exe is running (pid $($running.Id -join ', ')) - close it and build again."
+            }
+            throw "cannot replace ${exe}: $($_.Exception.Message)"
+        }
+    }
 
     # The file-dialog unit is pure UI code and by far the slowest one to
     # optimise; -O1 keeps the build quick with no measurable runtime difference.
