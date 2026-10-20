@@ -179,6 +179,21 @@ static std::string sdb_devices_command(const std::string& tizenloc)
     return sdb_path(tizenloc) + " devices";
 }
 
+// Diagnostics shown when a command fails: the device list plus the TV's
+// capabilities, so the log states the platform version the TV reports.
+static std::string sdb_diagnostics_command(const std::string& tizenloc, const std::string& target)
+{
+#ifdef _WIN32
+    const char* joiner = " & ";
+#else
+    const char* joiner = " ; ";
+#endif
+    std::string command = sdb_devices_command(tizenloc) + " 2>&1";
+    if (!target.empty())
+        command += std::string(joiner) + sdb_path(tizenloc) + " -s " + target + " capability 2>&1";
+    return command;
+}
+
 static std::string tizen_install_command(const std::string& tizenloc, const std::string& wgt)
 {
     return tizen_cli_path(tizenloc) + " install -n \"" + wgt + "\"";
@@ -242,6 +257,34 @@ static std::string tail_of(const std::string& text, std::size_t max_chars = 2400
     if (text.size() <= max_chars)
         return text;
     return "[...]\n" + text.substr(text.size() - max_chars);
+}
+
+// Turns a raw installer error into something actionable. Only codes that were
+// verified against a real TV are spelled out; everything else stays generic.
+static std::string install_failure_hint(const std::string& text)
+{
+    if (text.find("install failed[118019]") != std::string::npos)
+        return "118019: the TV rejected the certificate inside this .wgt.\n"
+               "A Samsung TV only installs packages signed with a Samsung "
+               "distributor\ncertificate that contains this TV's DUID (created "
+               "in Tizen Studio >\nCertificate Manager, or via `tizen "
+               "certificate`). Unsigned packages fail\nthe same way - the "
+               "certificate is the blocker, not the connection.";
+    if (text.find("install failed[118") != std::string::npos)
+        return "install failed[118xxx] is a certificate/signature rejection: the "
+               ".wgt must be\nsigned for this TV (Samsung distributor "
+               "certificate with the TV's DUID).";
+    if (text.find("device offline") != std::string::npos ||
+        text.find("device unauthorized") != std::string::npos)
+        return "The TV is listed but offline/unauthorized: re-enable developer "
+               "mode,\nre-enter this PC's IP address and reboot the TV, then "
+               "connect again.";
+    if (text.find("target not found") != std::string::npos ||
+        text.find("closed") != std::string::npos)
+        return "The TV closed the connection: check that the developer-mode "
+               "host IP\nis this PC, that the TV is not in standby, and that no "
+               "firewall blocks\nthe sdb server.";
+    return "";
 }
 
 // Starts `command` on a worker thread. When it fails, `diagnostic_command` is
@@ -498,7 +541,7 @@ int main(int, char**)
                 {
                     start_command("tizen install " + filePathName,
                                   tizen_install_command(tizenloc, filePathName),
-                                  sdb_devices_command(tizenloc));
+                                  sdb_diagnostics_command(tizenloc, target));
                 }
             }
             ImGui::EndDisabled();
@@ -566,7 +609,15 @@ int main(int, char**)
         }
 
            if (ImGui::BeginPopupModal("Command failed", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                const std::string hint = install_failure_hint(result_text);
                 ImGui::TextUnformatted("The Tizen CLI reported an error. Full output:");
+                if (!hint.empty())
+                {
+                    ImGui::Separator();
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.75f, 0.20f, 1.00f));
+                    ImGui::TextUnformatted(hint.c_str());
+                    ImGui::PopStyleColor();
+                }
                 ImGui::Separator();
                 ImGui::BeginChild("failure_log", ImVec2(760, 260), ImGuiChildFlags_Border, ImGuiWindowFlags_HorizontalScrollbar);
                 ImGui::TextUnformatted(tail_of(result_text).c_str());

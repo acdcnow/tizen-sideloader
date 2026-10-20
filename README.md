@@ -34,7 +34,26 @@ to the console, and the dialogs tell you to check it when a step fails.
    automatically (`IP:port` is only needed if you changed it).
 5. **Choose WGT** \u2192 pick your `.wgt` \u2192 **Sideload!**. The result appears in a dialog,
    the full transcript in the log window.
+### The .wgt must be signed for your TV
 
+A Samsung TV only installs packages whose certificate it trusts. An unsigned package - or
+one signed with somebody else's certificate - is refused with
+
+```
+app_id[MyApp] install failed[118019]
+```
+
+That is a certificate rejection, **not** a connection problem: `connect`, `push` and the
+transfer itself already succeeded at that point. To get a package installed you need a
+**Samsung distributor certificate that contains your TV's DUID**, created once in *Tizen
+Studio › Certificate Manager* (Samsung account required, the connected TV supplies its
+DUID), and then re-sign the widget with that profile (`tizen package -t wgt -s <profile>`
+or *Project › Build signed package*).
+
+A second, independent blocker: if the widget's `config.xml` declares a higher
+`required_version` than the TV's platform, it will not run either. `Connect!` logs the
+TV's `platform_version` (see `sdb -s <ip>:26101 capability`), so both numbers can be
+compared directly.
 # How to Build
 Tested on Linux and Windows. Other Unixes are untested (the Makefile has a MinGW branch,
 but it expects GLFW via `pkg-config`).

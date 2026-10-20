@@ -96,4 +96,7 @@ unchanged, so the Linux/macOS build behaves exactly as before):
 | Dialog "Tizen Studio CLI not found" | the configured folder has no `tools\sdb.exe` / `tools\ide\bin\tizen.bat`; install the CLI-only Tizen Studio and point "Configure tizen-studio" at that folder |
 | Dialog "Command failed" when connecting | read the dialog: it shows the exact command, the full output and the exit code. Typical: TV not in developer mode, PC IP not registered, wrong IP, TV offline |
 | `sdb` says the device is `offline` / `unauthorized` | developer mode not active on the TV, or the host IP was changed and the TV was not rebooted |
+| `app_id[...] install failed[118019]` | the TV rejects the certificate in the `.wgt`. Verified on a Samsung UE40NU7190 (Tizen 4.0): an unsigned test widget and a third-party-signed `.wgt` both fail with this code after `push` succeeded. Samsung TVs need a distributor certificate bound to the TV's DUID (Tizen Studio › Certificate Manager, Samsung account); re-sign the widget with that profile |
+| `install failed[118xxx]` (other codes) | also signature/certificate family — sign the package for this TV before retrying |
+| Sideload says the app is missing on the TV although install worked | check `required_version` in the widget's `config.xml` against the TV's `platform_version` (logged by the failure diagnostics) |
 | Blank/black ImGui window | GPU driver without OpenGL 3.0 — update the driver |

@@ -4,6 +4,30 @@ Notable changes to this fork. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); tags keep the upstream style
 (**no `v` prefix**).
 
+## [0.3.0] - 2026-10-20
+
+Verified against a real TV (Samsung UE40NU7190, Tizen 4.0, `10.0.1.236:26101`):
+connect and file transfer work; the install is refused by the TV because of the
+package certificate.
+
+### Added
+- **Installer error explanation** in the failure dialog: `install failed[118019]` is
+  decoded as "the TV rejected the certificate inside this .wgt" and names the fix
+  (Samsung distributor certificate containing the TV's DUID, created in Tizen Studio
+  › Certificate Manager). Other `118xxx` codes, `offline`/`unauthorized` and a closed
+  connection get their own hints. Codes that were not reproduced on hardware are not
+  claimed to mean anything specific.
+- Failure diagnostics now also run `sdb -s <ip>:26101 capability`, so the log shows the
+  TV's `platform_version`, `vendor_name` and `sdk_toolpath` next to the error.
+
+### Changed
+- The hint block is rendered above the captured output and highlighted, instead of only
+  listing generic "developer mode / same network" advice.
+
+### Notes
+- A `.wgt` whose `config.xml` asks for a higher `required_version` than the TV's
+  `platform_version` will still fail; the check above makes that visible in the log.
+
 ## [0.2.0] - 2026-10-20
 
 ### Added
