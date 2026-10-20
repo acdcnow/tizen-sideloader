@@ -32,3 +32,9 @@
 *.out
 *.app
 tizen-sideloader
+
+# Windows build output and vendored build dependencies
+# (libs/glfw is fetched by build_windows.ps1 on first run)
+dist/
+build/
+libs/

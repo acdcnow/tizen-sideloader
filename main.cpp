@@ -46,6 +46,30 @@ static void glfw_error_callback(int error, const char* description)
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
 }
 
+// ---------------------------------------------------------------------------
+// Tizen CLI invocation.
+// On Windows the tools are sdb.exe and tizen.bat and tizen-studio is commonly
+// installed under "C:\Program Files\...", so the tool path has to be quoted;
+// on Unix the original unquoted form is kept.
+// ---------------------------------------------------------------------------
+static std::string tizen_sdb_command(const char* tizenloc, const std::string& target)
+{
+#ifdef _WIN32
+    return std::string("\"") + tizenloc + "\\tools\\sdb.exe\" connect " + target;
+#else
+    return std::string(tizenloc) + "/tools/sdb connect " + target;
+#endif
+}
+
+static std::string tizen_install_command(const char* tizenloc, const std::string& wgt)
+{
+#ifdef _WIN32
+    return std::string("\"") + tizenloc + "\\tools\\ide\\bin\\tizen.bat\" install -n \"" + wgt + "\"";
+#else
+    return std::string(tizenloc) + "/tools/ide/bin/tizen install -n \"" + wgt + "\"";
+#endif
+}
+
 // Main code
 int main(int, char**)
 {
@@ -179,9 +203,8 @@ int main(int, char**)
 
             if (clicked & 1) {
                  std::cout << str0;
-                 std::ostringstream command;
-                 command << tizenloc << "/tools/sdb connect " << str2.str();
-                 int code = system(command.str().c_str());
+                 std::string command = tizen_sdb_command(tizenloc, str2.str());
+                 int code = system(command.c_str());
                  clicked = 0;
 
                  if (code == 0) {
@@ -226,9 +249,8 @@ int main(int, char**)
   
 
            if (sideload & 1) {
-               std::ostringstream sideloadcommand;
-               sideloadcommand << tizenloc <<"/tools/ide/bin/tizen install -n " << filePathName;
-               int sideloadcode = system(sideloadcommand.str().c_str());
+               std::string sideloadcommand = tizen_install_command(tizenloc, filePathName);
+               int sideloadcode = system(sideloadcommand.c_str());
                sideload = 0;
 
                if (sideloadcode == 0) {
